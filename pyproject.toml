@@ -76,6 +76,11 @@ lazy_loader = "*"
 tqdm = "*"
 wandb = "*"
 xgboost = "*"
+# Lets notebooks (e.g. sprints/*/experiment.ipynb) run against this pixi env as
+# a Jupyter kernel -- register with:
+#   pixi run python -m ipykernel install --user --name relational-transformer-pixi \
+#     --display-name "RT (pixi)"
+ipykernel = "*"
 # pinned until the relbench-hf branch (HF Hub data loading) lands in a relbench release
 relbench = { git = "https://github.com/snap-stanford/relbench.git", rev = "6e4a3a3d271f981b7f61e2ecbb6fd1c0f1cd3eeb" }
 
