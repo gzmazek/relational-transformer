@@ -35,6 +35,16 @@
 #   OUT_DIR          where results.json / ctx_sweep.png land     [default: eval_sweep_out]
 #   GRES             Slurm --gres value                          [default: gpu:1]
 #   TIME             Slurm --time value                          [default: 00:15:00]
+#   CONSTRAINT       Slurm --constraint (node feature) value      [default: unset -- no constraint]
+#
+# On a cluster where the same partition mixes GPU generations under one undifferentiated GRES
+# name (`gpu:N`, no type), CONSTRAINT is how you pin a specific one via node features from
+# `sinfo -N -o "%N %P %G %f"` -- e.g. this repo's cluster mixes H100 (`genoa,h100`, CC 9.0) and
+# V100S (`rome,v100s`, CC 7.0) nodes under one `gpu` partition; the installed torch build only
+# has kernels for CC>=7.5, so a plain `GRES=gpu:1` can land you on an unsupported V100S node.
+# Two ways around that on this specific cluster (adjust to whatever your `sinfo -N` shows):
+#   PARTITION=mig-preempt GRES=gpu:1g.10gb:1                 # MIG slice, same platform as the H100s
+#   PARTITION=gpu GRES=gpu:1 CONSTRAINT=h100                 # full H100, explicitly avoids v100s
 #
 # --- watching it live ---
 #   squeue -u $USER                              # confirm it's running (not still queued)
@@ -52,6 +62,7 @@ PARTITION="${PARTITION:?set PARTITION -- see: sinfo -o \"%P %G\"}"
 QOS="${QOS:?set QOS -- see: sacctmgr -p show associations user=\$USER}"
 GRES="${GRES:-gpu:1}"
 TIME="${TIME:-00:15:00}"
+CONSTRAINT="${CONSTRAINT:-}"
 
 CTX_SIZES="${CTX_SIZES:-128 256}"
 ITEMS_PER_TASK="${ITEMS_PER_TASK:-8}"
@@ -60,9 +71,17 @@ PRE_DIR="${PRE_DIR:-stanford-star/relbench-preprocessed}"
 TASK="${TASK:-rel-f1/driver-position}"
 OUT_DIR="${OUT_DIR:-eval_sweep_out}"
 
-echo "ctx_sizes=$CTX_SIZES items_per_task=$ITEMS_PER_TASK checkpoint=$CHECKPOINT out_dir=$OUT_DIR time=$TIME"
+echo "ctx_sizes=$CTX_SIZES items_per_task=$ITEMS_PER_TASK checkpoint=$CHECKPOINT out_dir=$OUT_DIR time=$TIME constraint=${CONSTRAINT:-<none>}"
+
+# --constraint is only included when CONSTRAINT is set -- sbatch has no "no constraint" value,
+# omitting the flag entirely is how you leave scheduling unconstrained.
+CONSTRAINT_ARGS=()
+if [ -n "$CONSTRAINT" ]; then
+    CONSTRAINT_ARGS=(--constraint="$CONSTRAINT")
+fi
 
 sbatch --job-name=eval-ctx-sweep --output=logs/eval-ctx-sweep-%j.out \
        --nodes=1 --gres="$GRES" --time="$TIME" \
        --account="$ACCOUNT" --partition="$PARTITION" --qos="$QOS" \
+       "${CONSTRAINT_ARGS[@]}" \
        --wrap="export PYTHONUNBUFFERED=1; pixi run build-sampler >/dev/null 2>&1 || true; pixi run python scripts/eval_ctx_sweep.py --checkpoint '$CHECKPOINT' --pre-dir '$PRE_DIR' --task '$TASK' --ctx-sizes $CTX_SIZES --items-per-task $ITEMS_PER_TASK --out-dir '$OUT_DIR'"
