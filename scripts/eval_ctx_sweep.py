@@ -20,12 +20,21 @@ this flag exists to work around):
 See the Insight in experiment.ipynb (Sprint 01 / 1.4 Part B) for why
 --disable-compile and the OpenMP fix exist -- both were found by actually
 running this on macOS, not guessed.
+
+LOGGING: every log() line is timestamped + elapsed-since-start and flush=True'd
+immediately, so `tail -f logs/eval-ctx-sweep-<jobid>.out` on the cluster shows
+real progress as it happens rather than a batch of output at the end. Python
+buffers stdout when it isn't a terminal (i.e. redirected to Slurm's log file),
+which would otherwise delay everything -- eval_ctx_sweep.sh also sets
+PYTHONUNBUFFERED=1 as a second layer of the same fix.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import time
+from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # harmless no-op if there's no conflict;
@@ -40,6 +49,13 @@ import torch
 from rt.checkpoints import load_rt_model
 from rt.recipes import get_tasks
 from rt.eval_utils import build_evaluator, metric_for
+
+_T0 = time.monotonic()
+
+
+def log(msg: str) -> None:
+    elapsed = time.monotonic() - _T0
+    print(f"[{datetime.now().strftime('%H:%M:%S')} +{elapsed:7.1f}s] {msg}", flush=True)
 
 
 def main() -> None:
@@ -63,16 +79,18 @@ def main() -> None:
                          "this where the compiler is broken (e.g. this Mac); leave it off on "
                          "the cluster so the fast compiled kernel actually runs")
     args = ap.parse_args()
+    log(f"starting: ctx_sizes={args.ctx_sizes} items_per_task={args.items_per_task} "
+        f"task={args.task} checkpoint={args.checkpoint} disable_compile={args.disable_compile}")
 
     if args.disable_compile:
         import torch._dynamo
         torch._dynamo.config.disable = True
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    log(f"loading checkpoint on {device} ...")
     net, config = load_rt_model(args.checkpoint, device=device, compile=False)
     net = net.to(torch.bfloat16)
-    print(f"loaded {config.get('name', args.checkpoint)} "
-          f"(task_type={config.get('task_type')}) on {device}, disable_compile={args.disable_compile}")
+    log(f"loaded {config.get('name', args.checkpoint)} (task_type={config.get('task_type')})")
 
     all_tasks = get_tasks("relbench_eval_test", args.pre_dir)
     tasks = [t for t in all_tasks if f"{t.db_name}/{t.table_name}" == args.task]
@@ -83,21 +101,23 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     results_by_ctx = []
-    for ctx_size in args.ctx_sizes:
+    for i, ctx_size in enumerate(args.ctx_sizes, 1):
         local_ctx_size = min(args.local_ctx_size_cap, ctx_size)
-        print(f"--- ctx_size={ctx_size} ---")
+        log(f"[{i}/{len(args.ctx_sizes)}] ctx_size={ctx_size} (local_ctx_size={local_ctx_size}) -- building evaluator ...")
         ev = build_evaluator(tasks, args.pre_dir, embedding_model=config["embedding_model"],
                              d_text=config["d_text"], device=device, ctx_size=ctx_size,
                              local_ctx_size=local_ctx_size, bfs_width=args.bfs_width,
                              items_per_task=args.items_per_task, shuffle_seed=0)
+        log(f"[{i}/{len(args.ctx_sizes)}] ctx_size={ctx_size} -- running forward pass over {args.items_per_task} row(s) ...")
         for task, _ctx, labels, preds_by_prefix, _nl in ev.evaluate_raw([(net, "")], [ctx_size]):
             metric_name, metric_value = metric_for(task.task_type, labels, preds_by_prefix[""],
                                                     reg_metric=args.reg_metric)
             n = len(labels)
         results_by_ctx.append({"ctx_size": ctx_size, "metric": metric_name, "value": metric_value, "n": n})
-        print(f"ctx_size={ctx_size}: {metric_name}={metric_value:.4f} (n={n})")
+        log(f"[{i}/{len(args.ctx_sizes)}] ctx_size={ctx_size}: {metric_name}={metric_value:.4f} (n={n}) -- done")
 
     (out_dir / "results.json").write_text(json.dumps(results_by_ctx, indent=2))
+    log(f"wrote {out_dir / 'results.json'}")
 
     metric_name = results_by_ctx[0]["metric"]
     xs = [r["ctx_size"] for r in results_by_ctx]
@@ -115,7 +135,7 @@ def main() -> None:
                  f"debug metric on a {args.items_per_task}-row local subsample, not a RelBench-leaderboard score")
     plt.tight_layout()
     fig.savefig(out_dir / "ctx_sweep.png", dpi=150)
-    print(f"\nwrote {out_dir / 'results.json'} and {out_dir / 'ctx_sweep.png'}")
+    log(f"wrote {out_dir / 'ctx_sweep.png'} -- all done")
 
 
 if __name__ == "__main__":
