@@ -41,6 +41,13 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # harmless no-op if there
 # needed on macOS where torch and numpy/the rustler extension each bundle their own OpenMP
 # runtime and loading both in one process aborts with "OMP: Error #15" otherwise.
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # a real cluster
+# OOM at ctx_size=1024 on a 10GB MIG slice showed "9.64 GiB in use... 2.14 GiB is reserved by
+# PyTorch but unallocated" -- close to the full 9.75 GiB cap, with a meaningful chunk stuck
+# unusable to fragmentation. This is PyTorch's own suggested fix for exactly that pattern; it
+# may push the MIG slice's ceiling out a bit, but a true out-of-memory (not just fragmentation)
+# at large ctx_size still needs more actual VRAM -- this isn't a substitute for a bigger GPU.
+
 import matplotlib
 matplotlib.use("Agg")  # headless -- this runs under Slurm / no display, always save to a file
 import matplotlib.pyplot as plt
