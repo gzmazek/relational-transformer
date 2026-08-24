@@ -107,28 +107,48 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # FIX (after a real cluster run: 128/256/512 succeeded, 1024 hit a fatal CUDA OOM on a
+    # 10GB MIG slice, and the unhandled exception crashed the whole process -- losing the three
+    # already-computed results too, since results.json/ctx_sweep.png were only written after the
+    # full loop). OOM at the top of a ctx_size sweep is an expected outcome on a memory-limited
+    # GPU, not a rare edge case -- catch it per ctx_size, keep going (a bigger ctx_size will just
+    # OOM again quickly, not hang), and write results.json after *every* ctx_size so a later
+    # crash can never lose earlier results again.
     results_by_ctx = []
     for i, ctx_size in enumerate(args.ctx_sizes, 1):
         local_ctx_size = min(args.local_ctx_size_cap, ctx_size)
         log(f"[{i}/{len(args.ctx_sizes)}] ctx_size={ctx_size} (local_ctx_size={local_ctx_size}) -- building evaluator ...")
-        ev = build_evaluator(tasks, args.pre_dir, embedding_model=config["embedding_model"],
-                             d_text=config["d_text"], device=device, ctx_size=ctx_size,
-                             local_ctx_size=local_ctx_size, bfs_width=args.bfs_width,
-                             items_per_task=args.items_per_task, shuffle_seed=0)
-        log(f"[{i}/{len(args.ctx_sizes)}] ctx_size={ctx_size} -- running forward pass over {args.items_per_task} row(s) ...")
-        for task, _ctx, labels, preds_by_prefix, _nl in ev.evaluate_raw([(net, "")], [ctx_size]):
-            metric_name, metric_value = metric_for(task.task_type, labels, preds_by_prefix[""],
-                                                    reg_metric=args.reg_metric)
-            n = len(labels)
-        results_by_ctx.append({"ctx_size": ctx_size, "metric": metric_name, "value": metric_value, "n": n})
-        log(f"[{i}/{len(args.ctx_sizes)}] ctx_size={ctx_size}: {metric_name}={metric_value:.4f} (n={n}) -- done")
+        try:
+            ev = build_evaluator(tasks, args.pre_dir, embedding_model=config["embedding_model"],
+                                 d_text=config["d_text"], device=device, ctx_size=ctx_size,
+                                 local_ctx_size=local_ctx_size, bfs_width=args.bfs_width,
+                                 items_per_task=args.items_per_task, shuffle_seed=0)
+            log(f"[{i}/{len(args.ctx_sizes)}] ctx_size={ctx_size} -- running forward pass over {args.items_per_task} row(s) ...")
+            for task, _ctx, labels, preds_by_prefix, _nl in ev.evaluate_raw([(net, "")], [ctx_size]):
+                metric_name, metric_value = metric_for(task.task_type, labels, preds_by_prefix[""],
+                                                        reg_metric=args.reg_metric)
+                n = len(labels)
+            results_by_ctx.append({"ctx_size": ctx_size, "metric": metric_name, "value": metric_value, "n": n})
+            log(f"[{i}/{len(args.ctx_sizes)}] ctx_size={ctx_size}: {metric_name}={metric_value:.4f} (n={n}) -- done")
+        except torch.OutOfMemoryError as e:
+            log(f"[{i}/{len(args.ctx_sizes)}] ctx_size={ctx_size} -- OUT OF MEMORY, skipping: {e}")
+            results_by_ctx.append({"ctx_size": ctx_size, "metric": None, "value": None, "n": 0, "error": "OOM"})
+            torch.cuda.empty_cache()
+        (out_dir / "results.json").write_text(json.dumps(results_by_ctx, indent=2))
 
-    (out_dir / "results.json").write_text(json.dumps(results_by_ctx, indent=2))
     log(f"wrote {out_dir / 'results.json'}")
 
-    metric_name = results_by_ctx[0]["metric"]
-    xs = [r["ctx_size"] for r in results_by_ctx]
-    ys = [r["value"] for r in results_by_ctx]
+    successful = [r for r in results_by_ctx if r["value"] is not None]
+    oom_sizes = [r["ctx_size"] for r in results_by_ctx if r["value"] is None]
+    if oom_sizes:
+        log(f"skipped (OOM): {oom_sizes}")
+    if not successful:
+        log("no ctx_size completed successfully -- nothing to plot")
+        return
+
+    metric_name = successful[0]["metric"]
+    xs = [r["ctx_size"] for r in successful]
+    ys = [r["value"] for r in successful]
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(xs, ys, marker="o", color="#2b6cb0")
@@ -138,8 +158,9 @@ def main() -> None:
     ax.set_xlabel("ctx_size")
     ax.set_ylabel(metric_name)
     better = "lower is better" if metric_name == "mae" else "higher is better"
+    oom_note = f" -- OOM, skipped: {oom_sizes}" if oom_sizes else ""
     ax.set_title(f"{args.task}: {metric_name} vs. context size ({better})\n"
-                 f"debug metric on a {args.items_per_task}-row local subsample, not a RelBench-leaderboard score")
+                 f"debug metric on a {args.items_per_task}-row local subsample, not a RelBench-leaderboard score{oom_note}")
     plt.tight_layout()
     fig.savefig(out_dir / "ctx_sweep.png", dpi=150)
     log(f"wrote {out_dir / 'ctx_sweep.png'} -- all done")
