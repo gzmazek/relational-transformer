@@ -45,6 +45,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless -- this runs under Slurm / no display, always save to a file
 import matplotlib.pyplot as plt
 import torch
+import torch._dynamo  # imported at module level, not inside main() -- see the FIX note below
 
 from rt.checkpoints import load_rt_model
 from rt.recipes import get_tasks
@@ -82,8 +83,14 @@ def main() -> None:
     log(f"starting: ctx_sizes={args.ctx_sizes} items_per_task={args.items_per_task} "
         f"task={args.task} checkpoint={args.checkpoint} disable_compile={args.disable_compile}")
 
+    # FIX: torch._dynamo used to be imported right here, inside this `if`. `import a.b` binds
+    # the top-level name `a` (not `a.b`) in the *current* scope -- so having it anywhere inside
+    # main(), even in a branch that doesn't run, makes Python treat `torch` as local to the
+    # whole function and shadow the module-level import. When --disable-compile wasn't passed
+    # (the cluster's normal case), that branch never executed, so the local `torch` was never
+    # assigned -- caught on a real cluster run: "UnboundLocalError: cannot access local
+    # variable 'torch'" on the very next line. Moved the import to module level instead.
     if args.disable_compile:
-        import torch._dynamo
         torch._dynamo.config.disable = True
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
