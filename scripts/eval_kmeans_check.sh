@@ -16,19 +16,13 @@
 #       --target-ctx-sizes 128 --items-per-task 1 --n-seeds 2 --disable-compile \
 #       --out-dir /tmp/kmeans_test
 #
-# --- launch on the cluster (small first pass -- genuinely smaller than the real
-# --- sweep below, and a different OUT_DIR so it can never collide with it even if
-# --- both end up running at once) ---
+# --- launch on the cluster (small first pass) ---
 #   ACCOUNT=<acct> PARTITION=mig-preempt QOS=<qos> GRES=gpu:1g.10gb:1 \
-#   TARGET_CTX_SIZES="128 256" ITEMS_PER_TASK=4 N_SEEDS=2 TIME=00:20:00 \
-#   OUT_DIR=cluster_run/kmeans_check_smoke \
 #   ./scripts/eval_kmeans_check.sh
 #
-# --- once that completes, the real sweep (this is just the tool's defaults --
-# --- ITEMS_PER_TASK/N_SEEDS/TARGET_CTX_SIZES below don't need restating, only
-# --- TIME does since the default (01:00:00) is tight for the full sweep) ---
+# --- once that completes, the real sweep (more seeds / bigger items_per_task) ---
 #   ACCOUNT=<acct> PARTITION=mig-preempt QOS=<qos> GRES=gpu:1g.10gb:1 \
-#   TIME=01:30:00 \
+#   ITEMS_PER_TASK=16 N_SEEDS=8 TIME=01:30:00 \
 #   ./scripts/eval_kmeans_check.sh
 #
 # --- knobs (env vars) ---

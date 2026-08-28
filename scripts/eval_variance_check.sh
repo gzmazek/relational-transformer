@@ -14,17 +14,13 @@
 #       --ctx-sizes 128 --items-per-task 1 --n-seeds 2 --disable-compile \
 #       --out-dir /tmp/variance_test
 #
-# --- launch on the cluster (small first pass -- genuinely smaller than the real
-# --- sweep below, and a different OUT_DIR so it can never collide with it even if
-# --- both end up running at once) ---
+# --- launch on the cluster (small first pass) ---
 #   ACCOUNT=<acct> PARTITION=mig-preempt QOS=<qos> GRES=gpu:1g.10gb:1 \
-#   CTX_SIZES="128 256" ITEMS_PER_TASK=4 N_SEEDS=2 TIME=00:15:00 \
-#   OUT_DIR=cluster_run/variation_check_smoke \
 #   ./scripts/eval_variance_check.sh
 #
-# --- once that completes, the real sweep (this is just the tool's defaults --
-# --- CTX_SIZES/ITEMS_PER_TASK/N_SEEDS below don't need restating) ---
+# --- once that completes, the real sweep (more seeds / bigger items_per_task) ---
 #   ACCOUNT=<acct> PARTITION=mig-preempt QOS=<qos> GRES=gpu:1g.10gb:1 \
+#   ITEMS_PER_TASK=16 N_SEEDS=8 TIME=01:00:00 \
 #   ./scripts/eval_variance_check.sh
 #
 # --- knobs (env vars) ---
