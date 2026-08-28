@@ -1,0 +1,260 @@
+#!/usr/bin/env python
+"""K-means context reduction vs. raw truncation, at matched ctx_size (Sprint 02 / D-005).
+
+Same seed-repeated sweep as eval_variance_check.py, but at each target ctx_size and
+each shuffle_seed, runs *two* conditions and records both:
+
+  - "blue": the existing baseline -- sample directly at target ctx_size, evaluate as-is
+    (identical to eval_variance_check.py's own condition).
+  - "red": oversample at oversample_factor * target ctx_size (default 5x), reduce back
+    down to target ctx_size via rt.context_select.kmeans_select (k-means over each
+    cell's own encoder embedding, one medoid per cluster, target cell always kept),
+    then evaluate the reduced batch.
+
+The k-means step only needs the model's per-cell encoder (no attention), so the
+expensive/quadratic transformer forward only ever runs at target ctx_size -- oversampling
+by 5x does not reopen the ctx_size>=768 OOM boundary found in Sprint 01.
+
+Local smoke test (tiny + eager, to catch bugs fast without waiting on Slurm):
+    pixi run python scripts/eval_kmeans_check.py \\
+        --target-ctx-sizes 128 --items-per-task 1 --n-seeds 2 --disable-compile \\
+        --out-dir /tmp/kmeans_test
+
+Cluster run (mig-preempt, via scripts/eval_kmeans_check.sh -- do NOT pass
+--disable-compile there, same reasoning as eval_variance_check.sh):
+    pixi run python scripts/eval_kmeans_check.py \\
+        --target-ctx-sizes 128 192 256 384 512 --items-per-task 16 --n-seeds 8
+
+LOGGING: same convention as eval_variance_check.py -- every log() line is
+timestamped + elapsed-since-start and flush=True'd immediately.
+"""
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # see eval_ctx_sweep.py -- same
+# macOS OpenMP double-init fix, harmless no-op elsewhere.
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # see
+# eval_ctx_sweep.py -- same fragmentation fix, harmless when it isn't needed.
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # headless -- this runs under Slurm / no display, always save to a file
+import matplotlib.pyplot as plt
+import torch
+import torch._dynamo  # module level, not inside main() -- see eval_ctx_sweep.py's FIX note
+
+from rt.checkpoints import load_rt_model
+from rt.context_select import gather_along_seq, kmeans_select
+from rt.recipes import get_tasks
+from rt.eval_utils import build_evaluator, metric_for
+
+_T0 = time.monotonic()
+
+
+def log(msg: str) -> None:
+    elapsed = time.monotonic() - _T0
+    print(f"[{datetime.now().strftime('%H:%M:%S')} +{elapsed:7.1f}s] {msg}", flush=True)
+
+
+def run_baseline(net, tasks, pre_dir, config, ctx_size, seed, args, device):
+    """"blue" condition: identical to eval_variance_check.py -- sample directly at
+    ctx_size, evaluate as-is via the normal Evaluator.evaluate_raw path."""
+    ev = build_evaluator(tasks, pre_dir, embedding_model=config["embedding_model"],
+                         d_text=config["d_text"], device=device, ctx_size=ctx_size,
+                         local_ctx_size=min(args.local_ctx_size_cap, ctx_size),
+                         bfs_width=args.bfs_width, items_per_task=args.items_per_task,
+                         shuffle_seed=seed, num_workers=0)
+    metric_name = metric_value = n = None
+    for task, _ctx, labels, preds_by_prefix, _nl in ev.evaluate_raw([(net, "")], [ctx_size]):
+        metric_name, metric_value = metric_for(task.task_type, labels, preds_by_prefix[""],
+                                                reg_metric=args.reg_metric)
+        n = len(labels)
+    del ev
+    gc.collect()
+    return metric_name, metric_value, n
+
+
+def run_kmeans(net, tasks, pre_dir, config, ctx_size, seed, args, device):
+    """"red" condition: sample at oversample_factor * ctx_size, reduce to ctx_size via
+    kmeans_select + gather_along_seq (rt.context_select), then evaluate the reduced
+    batch. Bypasses Evaluator.evaluate_raw's own truncation-to-ctx_size (net.predict's
+    v[:, :ctx_size]) since the reduction here is kmeans_select's job, not a prefix cut."""
+    oversample_ctx_size = args.oversample_factor * ctx_size
+    ev = build_evaluator(tasks, pre_dir, embedding_model=config["embedding_model"],
+                         d_text=config["d_text"], device=device, ctx_size=oversample_ctx_size,
+                         local_ctx_size=min(args.local_ctx_size_cap, oversample_ctx_size),
+                         bfs_width=args.bfs_width, items_per_task=args.items_per_task,
+                         shuffle_seed=seed, num_workers=0)
+    task = ev.tasks[0]
+    eval_loader = ev.eval_loaders[task]
+    eval_loader_iter = ev.eval_loader_iters[task]
+
+    # Same n_batches formula as Evaluator.evaluate_raw (evaluator.py) -- cross-rank
+    # uniformity doesn't matter here (world_size=1, ddp=False), just reproducing how
+    # many batches items_per_task actually needs.
+    n_batches = len(eval_loader.dataset)
+    if ev.items_per_task is not None:
+        n_batches = min(n_batches, max(1, ev.items_per_task // ev.eval_bs // ev.world_size))
+
+    val_key = "boolean_values" if task.task_type == "clf" and not ev.bool_as_num else "number_values"
+
+    labels_list, preds_list = [], []
+    net.eval()
+    with torch.inference_mode():
+        for _ in range(n_batches):
+            batch = next(eval_loader_iter)
+            batch_mask = batch.pop("batch_mask")
+
+            keep_idx = kmeans_select(batch, net, k=ctx_size, seed=seed)
+            reduced = gather_along_seq(batch, keep_idx)
+
+            preds_by_ctx = net.predict(reduced, [ctx_size], device, task, bool_as_num=ev.bool_as_num)
+            yhat = preds_by_ctx[ctx_size].cpu()
+
+            y = (reduced[val_key].squeeze(-1).float()
+                 * reduced["is_targets"].to(torch.float32)).sum(dim=1)
+
+            labels_list.append(y[batch_mask])
+            preds_list.append(yhat[batch_mask])
+
+    labels_np = torch.cat(labels_list).numpy()
+    preds_np = torch.cat(preds_list).numpy()
+    metric_name, metric_value = metric_for(task.task_type, labels_np, preds_np,
+                                            reg_metric=args.reg_metric)
+    n = len(labels_np)
+
+    ev.eval_loader_iters[task] = iter(eval_loader)  # tidy, matches Evaluator's own re-prime
+    del ev, eval_loader_iter
+    gc.collect()
+    return metric_name, metric_value, n
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--checkpoint", default="stanford-star/rt-j/regression")
+    ap.add_argument("--pre-dir", default="stanford-star/relbench-preprocessed")
+    ap.add_argument("--task", default="rel-f1/driver-position",
+                    help="'db/task-table' selector, as in scripts/eval.py --tasks")
+    ap.add_argument("--target-ctx-sizes", type=int, nargs="+", default=[128, 192, 256, 384, 512])
+    ap.add_argument("--oversample-factor", type=int, default=5,
+                    help="the 'red' condition samples at oversample_factor * target ctx_size, "
+                         "then k-means-reduces back down to the target ctx_size")
+    ap.add_argument("--items-per-task", type=int, default=16,
+                    help="fixed rows sampled per run -- same subset (via shuffle_seed) for "
+                         "both conditions at a given seed")
+    ap.add_argument("--n-seeds", type=int, default=8,
+                    help="repeats per ctx_size, each with a different shuffle_seed (also used "
+                         "as the k-means random_state for that repeat)")
+    ap.add_argument("--bfs-width", type=int, default=32)
+    ap.add_argument("--local-ctx-size-cap", type=int, default=256,
+                    help="local_ctx_size = min(this, ctx_size) for each point, applied to "
+                         "whichever ctx_size each condition actually samples at")
+    ap.add_argument("--reg-metric", default="mae", choices=["mae", "r2"])
+    ap.add_argument("--out-dir", default="cluster_run/kmeans_check")
+    ap.add_argument("--disable-compile", action="store_true",
+                    help="fall back to eager execution -- only pass this where the compiler "
+                         "is broken (e.g. this Mac); leave it off on the cluster")
+    args = ap.parse_args()
+    log(f"starting: target_ctx_sizes={args.target_ctx_sizes} oversample_factor={args.oversample_factor} "
+        f"items_per_task={args.items_per_task} n_seeds={args.n_seeds} task={args.task} "
+        f"disable_compile={args.disable_compile}")
+
+    if args.disable_compile:
+        torch._dynamo.config.disable = True
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    log(f"loading checkpoint on {device} ...")
+    net, config = load_rt_model(args.checkpoint, device=device, compile=False)
+    net = net.to(torch.bfloat16)
+    log(f"loaded {config.get('name', args.checkpoint)} (task_type={config.get('task_type')})")
+
+    all_tasks = get_tasks("relbench_eval_test", args.pre_dir)
+    tasks = [t for t in all_tasks if f"{t.db_name}/{t.table_name}" == args.task]
+    if not tasks:
+        raise SystemExit(f"{args.task} not found in relbench_eval_test tasks for {args.pre_dir}")
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # results.json is written after every single run (not just after each ctx_size), same
+    # reasoning as eval_variance_check.py -- a crash partway through never loses what's
+    # already computed.
+    results = []
+    n_runs = len(args.target_ctx_sizes) * args.n_seeds
+    run_i = 0
+    for ctx_size in args.target_ctx_sizes:
+        oversample_ctx_size = args.oversample_factor * ctx_size
+        for seed in range(args.n_seeds):
+            run_i += 1
+            log(f"[{run_i}/{n_runs}] ctx_size={ctx_size} shuffle_seed={seed} -- baseline ...")
+            metric_name, blue_value, blue_n = run_baseline(
+                net, tasks, args.pre_dir, config, ctx_size, seed, args, device)
+            log(f"[{run_i}/{n_runs}] ctx_size={ctx_size} shuffle_seed={seed} -- "
+                f"baseline {metric_name}={blue_value:.4f} (n={blue_n}) -- k-means "
+                f"(oversample={oversample_ctx_size}) ...")
+            _metric_name, red_value, red_n = run_kmeans(
+                net, tasks, args.pre_dir, config, ctx_size, seed, args, device)
+            log(f"[{run_i}/{n_runs}] ctx_size={ctx_size} shuffle_seed={seed}: "
+                f"baseline {metric_name}={blue_value:.4f} (n={blue_n})  "
+                f"kmeans {metric_name}={red_value:.4f} (n={red_n}) -- done")
+            results.append({
+                "ctx_size": ctx_size, "oversample_ctx_size": oversample_ctx_size,
+                "shuffle_seed": seed, "metric": metric_name,
+                "blue_value": blue_value, "blue_n": blue_n,
+                "red_value": red_value, "red_n": red_n,
+            })
+            (out_dir / "results.json").write_text(json.dumps(results, indent=2))
+
+    log(f"wrote {out_dir / 'results.json'}")
+
+    # Plot: grouped bars per ctx_size -- blue = baseline (raw truncation), red = k-means
+    # (from an oversample_factor x larger pool) -- mean +- 1 std across n_seeds, individual
+    # seed values overlaid as dots, same convention as eval_variance_check.py's plot.
+    metric_name = results[0]["metric"]
+    x_pos = np.arange(len(args.target_ctx_sizes))
+    width = 0.32
+    blue_means, blue_stds, red_means, red_stds = [], [], [], []
+    for ctx_size in args.target_ctx_sizes:
+        blue_vals = [r["blue_value"] for r in results if r["ctx_size"] == ctx_size]
+        red_vals = [r["red_value"] for r in results if r["ctx_size"] == ctx_size]
+        blue_means.append(np.mean(blue_vals))
+        blue_stds.append(np.std(blue_vals))
+        red_means.append(np.mean(red_vals))
+        red_stds.append(np.std(red_vals))
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.bar(x_pos - width / 2, blue_means, width, yerr=blue_stds, capsize=4,
+          color="#2b6cb0", label="baseline (raw truncation to ctx_size)")
+    ax.bar(x_pos + width / 2, red_means, width, yerr=red_stds, capsize=4,
+          color="#c53030", label=f"k-means (from {args.oversample_factor}x oversampled pool)")
+    for i, ctx_size in enumerate(args.target_ctx_sizes):
+        blue_vals = [r["blue_value"] for r in results if r["ctx_size"] == ctx_size]
+        red_vals = [r["red_value"] for r in results if r["ctx_size"] == ctx_size]
+        ax.scatter([x_pos[i] - width / 2] * len(blue_vals), blue_vals,
+                  color="#1a365d", zorder=3, s=18)
+        ax.scatter([x_pos[i] + width / 2] * len(red_vals), red_vals,
+                  color="#742a2a", zorder=3, s=18)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(args.target_ctx_sizes)
+    ax.set_xlabel("ctx_size")
+    ax.set_ylabel(metric_name)
+    ax.set_title(f"{args.task}: {metric_name}, baseline vs. k-means-from-"
+                f"{args.oversample_factor}x, mean ± 1 std across {args.n_seeds} seeds\n"
+                f"(items_per_task={args.items_per_task}, dots = individual seed runs)")
+    ax.legend(frameon=False)
+    plt.tight_layout()
+    fig.savefig(out_dir / "kmeans_check.png", dpi=150)
+    log(f"wrote {out_dir / 'kmeans_check.png'} -- all done")
+
+
+if __name__ == "__main__":
+    main()
