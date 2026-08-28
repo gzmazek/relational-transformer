@@ -37,6 +37,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # see eval_ctx_sweep.py -
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # see
 # eval_ctx_sweep.py -- same fragmentation fix, harmless when it isn't needed.
 
+import gc
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # headless -- this runs under Slurm / no display, always save to a file
@@ -110,10 +112,19 @@ def main() -> None:
             run_i += 1
             log(f"[{run_i}/{n_runs}] ctx_size={ctx_size} shuffle_seed={seed} "
                 f"-- building evaluator ...")
+            # num_workers=0: build_evaluator() defaults to 2 DataLoader worker *subprocesses*
+            # per Evaluator -- fine for eval_ctx_sweep.py's one-Evaluator-per-process-run, but
+            # this loop builds up to 40 Evaluators in one process (5 ctx_sizes x 8 seeds) and
+            # Evaluator exposes no close()/shutdown(), so cleanup relies on Python's GC timing.
+            # A real run confirmed this: 17 runs completed fine, then a Slurm oom_kill (host
+            # RAM, not GPU) on run 18 -- worker processes from earlier Evaluators piling up
+            # faster than they were reclaimed. items_per_task is small here (16), so the
+            # parallelism num_workers=2 buys is negligible -- not worth the leak risk.
             ev = build_evaluator(tasks, args.pre_dir, embedding_model=config["embedding_model"],
                                  d_text=config["d_text"], device=device, ctx_size=ctx_size,
                                  local_ctx_size=local_ctx_size, bfs_width=args.bfs_width,
-                                 items_per_task=args.items_per_task, shuffle_seed=seed)
+                                 items_per_task=args.items_per_task, shuffle_seed=seed,
+                                 num_workers=0)
             for task, _ctx, labels, preds_by_prefix, _nl in ev.evaluate_raw(
                 [(net, "")], [ctx_size]
             ):
@@ -125,6 +136,11 @@ def main() -> None:
             log(f"[{run_i}/{n_runs}] ctx_size={ctx_size} shuffle_seed={seed}: "
                 f"{metric_name}={metric_value:.4f} (n={n}) -- done")
             (out_dir / "results.json").write_text(json.dumps(results, indent=2))
+
+            # Cheap extra insurance on top of num_workers=0: force this Evaluator's memory
+            # back before building the next one, rather than trust GC timing across 40 builds.
+            del ev
+            gc.collect()
 
     log(f"wrote {out_dir / 'results.json'}")
 
