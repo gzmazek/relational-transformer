@@ -117,7 +117,7 @@ def run_kmeans(net, tasks, pre_dir, config, ctx_size, seed, args, device):
             reduced = gather_along_seq(batch, keep_idx)
 
             preds_by_ctx = net.predict(reduced, [ctx_size], device, task, bool_as_num=ev.bool_as_num)
-            yhat = preds_by_ctx[ctx_size].cpu()
+            yhat = preds_by_ctx[ctx_size].float().cpu()  # bfloat16 has no numpy equivalent
 
             y = (reduced[val_key].squeeze(-1).float()
                  * reduced["is_targets"].to(torch.float32)).sum(dim=1)
