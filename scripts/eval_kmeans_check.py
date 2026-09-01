@@ -51,6 +51,21 @@ import matplotlib.pyplot as plt
 import torch
 import torch._dynamo  # module level, not inside main() -- see eval_ctx_sweep.py's FIX note
 
+# model.py compiles self.forward with torch.compile(dynamic=False): every distinct input
+# *shape* gets its own specialized compiled kernel, no shape polymorphism. This script calls
+# self() at up to 2 * len(target_ctx_sizes) distinct (batch_size, seq_len) shapes -- baseline
+# and k-means use different eval_bs at the same ctx_size, since eval_bs = tokens_per_gpu //
+# sampled_ctx_size and the two conditions sample at different sizes (ctx_size vs.
+# oversample_factor * ctx_size). torch._dynamo.config.recompile_limit defaults to 8: past
+# that many distinct shapes for one guarded function, dynamo silently falls back to eager
+# execution instead of compiling a 9th specialization. Eager/unfused flex_attention
+# materializes the full (bs, heads, seq, seq) score matrix, which is what actually OOM'd on
+# the real cluster run (recompile_limit hit right at shape #9, ctx_size=512's baseline, after
+# {128,192,256,384} x {baseline, kmeans} filled the cache) -- not a host-RAM leak like the
+# earlier eval_variance_check.py OOM. Raise the cap so every shape this script can produce
+# gets its own compiled kernel instead of falling back.
+torch._dynamo.config.recompile_limit = 64
+
 from rt.checkpoints import load_rt_model
 from rt.context_select import gather_along_seq, kmeans_select
 from rt.recipes import get_tasks
