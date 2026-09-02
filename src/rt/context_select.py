@@ -18,6 +18,7 @@ transformer forward only ever runs on the *reduced* batch, at ``target_ctx_size`
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 from sklearn.cluster import KMeans
 
@@ -70,21 +71,32 @@ def gather_along_seq(batch, keep_idx):
     return out
 
 
-def kmeans_select(batch, net, k, seed=0):
-    """select_fn: reduce ``batch`` to ``k`` cells per row via k-means over
-    ``embed_cells(batch, net)``. Each cluster contributes its *medoid* (the real
-    candidate closest to the cluster centroid), not the centroid itself -- a real
-    observed cell, same "real rows, not synthetic factors" spirit as CUR (D-002).
-    The target cell always fills 1 of the ``k`` slots; the other ``k - 1`` come from
-    k-means over the remaining non-target, non-padding candidates. A row with fewer
-    than ``k - 1`` real candidates just keeps all of it (no clustering) and pads the
-    rest, same as the model already handles padding. Phantom rows (no target cell,
-    from eval batch overshoot -- see ``net.predict``'s docstring) are cheap to
-    detect and skip clustering for, since their result is discarded downstream via
-    ``batch_mask``.
+def kmeans_select_multi(batch, net, k, seed=0, modes=("diverse", "packed")):
+    """Fit k-means *once* per row -- ``n_slots = k - 1`` clusters over the non-target,
+    non-padding candidates, same as the original D-005 prototype -- and derive
+    ``keep_idx`` for every mode in ``modes`` from that single fit, so different
+    take-rules are compared against the exact same clustering rather than
+    accidentally-identical separate fits (both modes see the same oversampled
+    candidate pool and the same ``KMeans(..., random_state=seed)`` result):
 
-    Returns ``keep_idx``: ``(bs, k)`` ``LongTensor`` of seq-dim indices into
-    ``batch``, one per row.
+    - ``"diverse"`` (the original D-005 prototype): one *medoid* per cluster -- the
+      real candidate closest to its own cluster's centroid -- one per cluster,
+      guaranteeing every cluster contributes exactly one pick. Real observed cells,
+      not synthetic centroids, same "real rows" spirit as CUR (D-002).
+    - ``"packed"``: rank ALL candidates by distance to their OWN cluster's centroid
+      and take the top ``n_slots`` globally -- a tight/dense cluster can contribute
+      several picks, a loose cluster may contribute none. Same clustering as
+      ``"diverse"``, a different take-rule from it.
+
+    The target cell always fills 1 of the ``k`` slots, in every mode. A row with
+    fewer than ``k - 1`` real candidates skips clustering (nothing to compare) and
+    just keeps all of it, padding the rest, same as the model already handles
+    padding. Phantom rows (no target cell, from eval batch overshoot -- see
+    ``net.predict``'s docstring) are cheap to detect and skip clustering for too,
+    since their result is discarded downstream via ``batch_mask``.
+
+    Returns ``{mode: keep_idx}``, each ``(bs, k)`` ``LongTensor`` of seq-dim indices
+    into ``batch``.
     """
     x = embed_cells(batch, net)  # (bs, seq_len, d_model)
     bs, seq_len, _ = x.shape
@@ -92,38 +104,61 @@ def kmeans_select(batch, net, k, seed=0):
     is_padding = batch["is_padding"].to(x.device)
     is_candidate = ~is_targets & ~is_padding
 
-    keep_idx = torch.zeros(bs, k, dtype=torch.long)
+    keep_idx = {m: torch.zeros(bs, k, dtype=torch.long) for m in modes}
     for row in range(bs):
         target_idx = is_targets[row].nonzero(as_tuple=True)[0]  # 1 for a real row, 0 for phantom
         n_slots = k - target_idx.numel()
 
         if target_idx.numel() == 0:
             # phantom row (no target) -- result is discarded via batch_mask downstream,
-            # skip clustering and just fill with whatever's there.
+            # skip clustering and just fill with whatever's there. Same for every mode.
             row_idx = torch.arange(min(k, seq_len), device=x.device)
-        else:
-            cand_idx = is_candidate[row].nonzero(as_tuple=True)[0]
-            pad_idx = is_padding[row].nonzero(as_tuple=True)[0]
+            if row_idx.numel() < k:
+                top_up = torch.arange(seq_len, device=x.device)[: k - row_idx.numel()]
+                row_idx = torch.cat([row_idx, top_up])
+            for m in modes:
+                keep_idx[m][row] = row_idx[:k].cpu()
+            continue
 
-            if cand_idx.numel() <= n_slots:
-                # not enough real candidates to cluster -- keep them all, pad the rest
-                n_pad = n_slots - cand_idx.numel()
-                fill = pad_idx[:n_pad]
-                row_idx = torch.cat([target_idx, cand_idx, fill])
+        cand_idx = is_candidate[row].nonzero(as_tuple=True)[0]
+        pad_idx = is_padding[row].nonzero(as_tuple=True)[0]
+
+        if cand_idx.numel() <= n_slots:
+            # not enough real candidates to cluster -- keep them all, pad the rest.
+            # No selection choice to make, so every mode gets the same result.
+            n_pad = n_slots - cand_idx.numel()
+            fill = pad_idx[:n_pad]
+            row_idx = torch.cat([target_idx, cand_idx, fill])
+            if row_idx.numel() < k:
+                top_up = torch.arange(seq_len, device=x.device)[: k - row_idx.numel()]
+                row_idx = torch.cat([row_idx, top_up])
+            for m in modes:
+                keep_idx[m][row] = row_idx[:k].cpu()
+            continue
+
+        x_cand = x[row, cand_idx].float().cpu().numpy()
+        km = KMeans(n_clusters=n_slots, n_init="auto", random_state=seed).fit(x_cand)
+        labels = km.labels_
+        d_own = ((x_cand - km.cluster_centers_[labels]) ** 2).sum(axis=1)  # dist to OWN centroid
+
+        for m in modes:
+            if m == "diverse":
+                picks_local = np.array([
+                    (members := (labels == c).nonzero()[0])[d_own[members].argmin()]
+                    for c in range(n_slots)
+                ])
+            elif m == "packed":
+                picks_local = np.argsort(d_own)[:n_slots]
             else:
-                x_cand = x[row, cand_idx].float().cpu().numpy()
-                km = KMeans(n_clusters=n_slots, n_init="auto", random_state=seed).fit(x_cand)
-                medoid_local = []
-                for c in range(n_slots):
-                    members = (km.labels_ == c).nonzero()[0]
-                    d = ((x_cand[members] - km.cluster_centers_[c]) ** 2).sum(axis=1)
-                    medoid_local.append(members[d.argmin()])
-                medoids = cand_idx[torch.as_tensor(medoid_local, dtype=torch.long, device=x.device)]
-                row_idx = torch.cat([target_idx, medoids])
-
-        if row_idx.numel() < k:  # defensive top-up, e.g. an almost-empty phantom row
-            top_up = torch.arange(seq_len, device=x.device)[: k - row_idx.numel()]
-            row_idx = torch.cat([row_idx, top_up])
-        keep_idx[row] = row_idx[:k].cpu()
+                raise ValueError(f"unknown mode {m!r}")
+            picks = cand_idx[torch.as_tensor(picks_local, dtype=torch.long, device=x.device)]
+            row_idx = torch.cat([target_idx, picks])
+            keep_idx[m][row] = row_idx[:k].cpu()
 
     return keep_idx
+
+
+def kmeans_select(batch, net, k, seed=0, mode="diverse"):
+    """Single-mode convenience wrapper around :func:`kmeans_select_multi` (see its
+    docstring for the exact selection rule per mode)."""
+    return kmeans_select_multi(batch, net, k, seed=seed, modes=(mode,))[mode]

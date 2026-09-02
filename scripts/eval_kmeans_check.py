@@ -1,15 +1,26 @@
 #!/usr/bin/env python
 """K-means context reduction vs. raw truncation, at matched ctx_size (Sprint 02 / D-005).
 
-Same seed-repeated sweep as eval_variance_check.py, but at each target ctx_size and
-each shuffle_seed, runs *two* conditions and records both:
+Same seed-repeated sweep as eval_variance_check.py, but at each target ctx_size and each
+shuffle_seed, runs *three* conditions and records all of them:
 
-  - "blue": the existing baseline -- sample directly at target ctx_size, evaluate as-is
-    (identical to eval_variance_check.py's own condition).
-  - "red": oversample at oversample_factor * target ctx_size (default 5x), reduce back
-    down to target ctx_size via rt.context_select.kmeans_select (k-means over each
-    cell's own encoder embedding, one medoid per cluster, target cell always kept),
-    then evaluate the reduced batch.
+  - "baseline": the existing eval_variance_check.py condition -- sample directly at target
+    ctx_size, evaluate as-is.
+  - "diverse": oversample at oversample_factor * target ctx_size (default 5x), fit k-means
+    over each non-target cell's own encoder embedding (n_slots = ctx_size - 1 clusters), and
+    take one *medoid* per cluster -- guarantees every cluster contributes exactly one pick
+    (maximal diversity, minimal redundancy). This was the original D-005 prototype's only
+    k-means condition.
+  - "packed": the SAME k-means fit as "diverse" (same oversampled pool, same clustering, same
+    seed) -- but instead of one-per-cluster, rank every candidate by distance to its OWN
+    cluster's centroid and take the top (ctx_size - 1) globally. A tight/dense cluster can
+    contribute several picks; a loose cluster may contribute none. Same clusters, different
+    take-rule -- tests whether enforcing diversity across clusters actually helps over just
+    taking the globally most "typical" points.
+
+"diverse" and "packed" share one oversampled Evaluator/batch and one k-means fit per
+(ctx_size, seed) -- see rt.context_select.kmeans_select_multi -- so this only costs one extra
+net.predict() call over the original 2-condition version, not a second full sampling pass.
 
 The k-means step only needs the model's per-cell encoder (no attention), so the
 expensive/quadratic transformer forward only ever runs at target ctx_size -- oversampling
@@ -53,25 +64,27 @@ import torch._dynamo  # module level, not inside main() -- see eval_ctx_sweep.py
 
 # model.py compiles self.forward with torch.compile(dynamic=False): every distinct input
 # *shape* gets its own specialized compiled kernel, no shape polymorphism. This script calls
-# self() at up to 2 * len(target_ctx_sizes) distinct (batch_size, seq_len) shapes -- baseline
-# and k-means use different eval_bs at the same ctx_size, since eval_bs = tokens_per_gpu //
-# sampled_ctx_size and the two conditions sample at different sizes (ctx_size vs.
-# oversample_factor * ctx_size). torch._dynamo.config.recompile_limit defaults to 8: past
-# that many distinct shapes for one guarded function, dynamo silently falls back to eager
-# execution instead of compiling a 9th specialization. Eager/unfused flex_attention
-# materializes the full (bs, heads, seq, seq) score matrix, which is what actually OOM'd on
-# the real cluster run (recompile_limit hit right at shape #9, ctx_size=512's baseline, after
-# {128,192,256,384} x {baseline, kmeans} filled the cache) -- not a host-RAM leak like the
-# earlier eval_variance_check.py OOM. Raise the cap so every shape this script can produce
-# gets its own compiled kernel instead of falling back.
+# self() at up to 2 * len(target_ctx_sizes) distinct (batch_size, seq_len) shapes -- "baseline"
+# and the shared "diverse"/"packed" oversampled Evaluator use different eval_bs at the same
+# ctx_size, since eval_bs = tokens_per_gpu // sampled_ctx_size and they sample at different
+# sizes (ctx_size vs. oversample_factor * ctx_size); "diverse" and "packed" themselves share
+# one Evaluator so they don't add a third shape. torch._dynamo.config.recompile_limit defaults
+# to 8: past that many distinct shapes for one guarded function, dynamo silently falls back to
+# eager execution instead of compiling a 9th specialization. Eager/unfused flex_attention
+# materializes the full (bs, heads, seq, seq) score matrix, which is what actually OOM'd on a
+# real cluster run of the original 2-condition version (recompile_limit hit right at shape #9)
+# -- not a host-RAM leak like the earlier eval_variance_check.py OOM. Raise the cap so every
+# shape this script can produce gets its own compiled kernel instead of falling back.
 torch._dynamo.config.recompile_limit = 64
 
 from rt.checkpoints import load_rt_model
-from rt.context_select import gather_along_seq, kmeans_select
+from rt.context_select import gather_along_seq, kmeans_select_multi
 from rt.recipes import get_tasks
 from rt.eval_utils import build_evaluator, metric_for
 
 _T0 = time.monotonic()
+
+MODES = ("diverse", "packed")
 
 
 def log(msg: str) -> None:
@@ -80,7 +93,7 @@ def log(msg: str) -> None:
 
 
 def run_baseline(net, tasks, pre_dir, config, ctx_size, seed, args, device):
-    """"blue" condition: identical to eval_variance_check.py -- sample directly at
+    """"baseline" condition: identical to eval_variance_check.py -- sample directly at
     ctx_size, evaluate as-is via the normal Evaluator.evaluate_raw path."""
     ev = build_evaluator(tasks, pre_dir, embedding_model=config["embedding_model"],
                          d_text=config["d_text"], device=device, ctx_size=ctx_size,
@@ -97,11 +110,15 @@ def run_baseline(net, tasks, pre_dir, config, ctx_size, seed, args, device):
     return metric_name, metric_value, n
 
 
-def run_kmeans(net, tasks, pre_dir, config, ctx_size, seed, args, device):
-    """"red" condition: sample at oversample_factor * ctx_size, reduce to ctx_size via
-    kmeans_select + gather_along_seq (rt.context_select), then evaluate the reduced
-    batch. Bypasses Evaluator.evaluate_raw's own truncation-to-ctx_size (net.predict's
-    v[:, :ctx_size]) since the reduction here is kmeans_select's job, not a prefix cut."""
+def run_kmeans_variants(net, tasks, pre_dir, config, ctx_size, seed, args, device):
+    """"diverse" and "packed" conditions: sample once at oversample_factor * ctx_size, fit
+    k-means once per batch (rt.context_select.kmeans_select_multi), derive both modes' reduced
+    batches from that single fit, evaluate each. Bypasses Evaluator.evaluate_raw's own
+    truncation-to-ctx_size (net.predict's v[:, :ctx_size]) since the reduction here is
+    kmeans_select_multi's job, not a prefix cut.
+
+    Returns {mode: (metric_name, metric_value, n)} for mode in MODES.
+    """
     oversample_ctx_size = args.oversample_factor * ctx_size
     ev = build_evaluator(tasks, pre_dir, embedding_model=config["embedding_model"],
                          d_text=config["d_text"], device=device, ctx_size=oversample_ctx_size,
@@ -121,35 +138,39 @@ def run_kmeans(net, tasks, pre_dir, config, ctx_size, seed, args, device):
 
     val_key = "boolean_values" if task.task_type == "clf" and not ev.bool_as_num else "number_values"
 
-    labels_list, preds_list = [], []
+    labels_list = {m: [] for m in MODES}
+    preds_list = {m: [] for m in MODES}
     net.eval()
     with torch.inference_mode():
         for _ in range(n_batches):
             batch = next(eval_loader_iter)
             batch_mask = batch.pop("batch_mask")
 
-            keep_idx = kmeans_select(batch, net, k=ctx_size, seed=seed)
-            reduced = gather_along_seq(batch, keep_idx)
+            keep_idx_by_mode = kmeans_select_multi(batch, net, k=ctx_size, seed=seed, modes=MODES)
+            for m in MODES:
+                reduced = gather_along_seq(batch, keep_idx_by_mode[m])
+                preds_by_ctx = net.predict(reduced, [ctx_size], device, task,
+                                           bool_as_num=ev.bool_as_num)
+                yhat = preds_by_ctx[ctx_size].float().cpu()  # bfloat16 has no numpy equivalent
 
-            preds_by_ctx = net.predict(reduced, [ctx_size], device, task, bool_as_num=ev.bool_as_num)
-            yhat = preds_by_ctx[ctx_size].float().cpu()  # bfloat16 has no numpy equivalent
+                y = (reduced[val_key].squeeze(-1).float()
+                     * reduced["is_targets"].to(torch.float32)).sum(dim=1)
 
-            y = (reduced[val_key].squeeze(-1).float()
-                 * reduced["is_targets"].to(torch.float32)).sum(dim=1)
+                labels_list[m].append(y[batch_mask])
+                preds_list[m].append(yhat[batch_mask])
 
-            labels_list.append(y[batch_mask])
-            preds_list.append(yhat[batch_mask])
-
-    labels_np = torch.cat(labels_list).numpy()
-    preds_np = torch.cat(preds_list).numpy()
-    metric_name, metric_value = metric_for(task.task_type, labels_np, preds_np,
-                                            reg_metric=args.reg_metric)
-    n = len(labels_np)
+    out = {}
+    for m in MODES:
+        labels_np = torch.cat(labels_list[m]).numpy()
+        preds_np = torch.cat(preds_list[m]).numpy()
+        metric_name, metric_value = metric_for(task.task_type, labels_np, preds_np,
+                                                reg_metric=args.reg_metric)
+        out[m] = (metric_name, metric_value, len(labels_np))
 
     ev.eval_loader_iters[task] = iter(eval_loader)  # tidy, matches Evaluator's own re-prime
     del ev, eval_loader_iter
     gc.collect()
-    return metric_name, metric_value, n
+    return out
 
 
 def main() -> None:
@@ -161,11 +182,11 @@ def main() -> None:
                     help="'db/task-table' selector, as in scripts/eval.py --tasks")
     ap.add_argument("--target-ctx-sizes", type=int, nargs="+", default=[128, 192, 256, 384, 512])
     ap.add_argument("--oversample-factor", type=int, default=5,
-                    help="the 'red' condition samples at oversample_factor * target ctx_size, "
-                         "then k-means-reduces back down to the target ctx_size")
+                    help="'diverse'/'packed' sample at oversample_factor * target ctx_size, "
+                         "then k-means-reduce back down to the target ctx_size")
     ap.add_argument("--items-per-task", type=int, default=16,
                     help="fixed rows sampled per run -- same subset (via shuffle_seed) for "
-                         "both conditions at a given seed")
+                         "all three conditions at a given seed")
     ap.add_argument("--n-seeds", type=int, default=8,
                     help="repeats per ctx_size, each with a different shuffle_seed (also used "
                          "as the k-means random_state for that repeat)")
@@ -211,61 +232,63 @@ def main() -> None:
         for seed in range(args.n_seeds):
             run_i += 1
             log(f"[{run_i}/{n_runs}] ctx_size={ctx_size} shuffle_seed={seed} -- baseline ...")
-            metric_name, blue_value, blue_n = run_baseline(
+            metric_name, baseline_value, baseline_n = run_baseline(
                 net, tasks, args.pre_dir, config, ctx_size, seed, args, device)
             log(f"[{run_i}/{n_runs}] ctx_size={ctx_size} shuffle_seed={seed} -- "
-                f"baseline {metric_name}={blue_value:.4f} (n={blue_n}) -- k-means "
-                f"(oversample={oversample_ctx_size}) ...")
-            _metric_name, red_value, red_n = run_kmeans(
+                f"baseline {metric_name}={baseline_value:.4f} (n={baseline_n}) -- "
+                f"diverse+packed (oversample={oversample_ctx_size}) ...")
+            variants = run_kmeans_variants(
                 net, tasks, args.pre_dir, config, ctx_size, seed, args, device)
+            _mn, diverse_value, diverse_n = variants["diverse"]
+            _mn, packed_value, packed_n = variants["packed"]
             log(f"[{run_i}/{n_runs}] ctx_size={ctx_size} shuffle_seed={seed}: "
-                f"baseline {metric_name}={blue_value:.4f} (n={blue_n})  "
-                f"kmeans {metric_name}={red_value:.4f} (n={red_n}) -- done")
+                f"baseline {metric_name}={baseline_value:.4f} (n={baseline_n})  "
+                f"diverse {metric_name}={diverse_value:.4f} (n={diverse_n})  "
+                f"packed {metric_name}={packed_value:.4f} (n={packed_n}) -- done")
             results.append({
                 "ctx_size": ctx_size, "oversample_ctx_size": oversample_ctx_size,
                 "shuffle_seed": seed, "metric": metric_name,
-                "blue_value": blue_value, "blue_n": blue_n,
-                "red_value": red_value, "red_n": red_n,
+                "baseline_value": baseline_value, "baseline_n": baseline_n,
+                "diverse_value": diverse_value, "diverse_n": diverse_n,
+                "packed_value": packed_value, "packed_n": packed_n,
             })
             (out_dir / "results.json").write_text(json.dumps(results, indent=2))
 
     log(f"wrote {out_dir / 'results.json'}")
 
-    # Plot: grouped bars per ctx_size -- blue = baseline (raw truncation), red = k-means
-    # (from an oversample_factor x larger pool) -- mean +- 1 std across n_seeds, individual
-    # seed values overlaid as dots, same convention as eval_variance_check.py's plot.
+    # Plot: 3 grouped bars per ctx_size -- baseline (raw truncation), diverse (one medoid per
+    # cluster), packed (same clustering, top-N globally by distance to own centroid) -- mean
+    # +- 1 std across n_seeds, individual seed values overlaid as dots.
     metric_name = results[0]["metric"]
     x_pos = np.arange(len(args.target_ctx_sizes))
-    width = 0.32
-    blue_means, blue_stds, red_means, red_stds = [], [], [], []
-    for ctx_size in args.target_ctx_sizes:
-        blue_vals = [r["blue_value"] for r in results if r["ctx_size"] == ctx_size]
-        red_vals = [r["red_value"] for r in results if r["ctx_size"] == ctx_size]
-        blue_means.append(np.mean(blue_vals))
-        blue_stds.append(np.std(blue_vals))
-        red_means.append(np.mean(red_vals))
-        red_stds.append(np.std(red_vals))
-
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.bar(x_pos - width / 2, blue_means, width, yerr=blue_stds, capsize=4,
-          color="#2b6cb0", label="baseline (raw truncation to ctx_size)")
-    ax.bar(x_pos + width / 2, red_means, width, yerr=red_stds, capsize=4,
-          color="#c53030", label=f"k-means (from {args.oversample_factor}x oversampled pool)")
-    for i, ctx_size in enumerate(args.target_ctx_sizes):
-        blue_vals = [r["blue_value"] for r in results if r["ctx_size"] == ctx_size]
-        red_vals = [r["red_value"] for r in results if r["ctx_size"] == ctx_size]
-        ax.scatter([x_pos[i] - width / 2] * len(blue_vals), blue_vals,
-                  color="#1a365d", zorder=3, s=18)
-        ax.scatter([x_pos[i] + width / 2] * len(red_vals), red_vals,
-                  color="#742a2a", zorder=3, s=18)
+    width = 0.25
+    series = {
+        "baseline": ("#2b6cb0", "#1a365d", "baseline (raw truncation to ctx_size)", -1),
+        "diverse":  ("#c53030", "#742a2a", "diverse (one medoid per cluster)", 0),
+        "packed":   ("#2f855a", "#1c4532", "packed (same clusters, top-N by dist-to-centroid)", 1),
+    }
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    for mode, (bar_color, dot_color, label, offset) in series.items():
+        means, stds = [], []
+        for ctx_size in args.target_ctx_sizes:
+            vals = [r[f"{mode}_value"] for r in results if r["ctx_size"] == ctx_size]
+            means.append(np.mean(vals))
+            stds.append(np.std(vals))
+        ax.bar(x_pos + offset * width, means, width, yerr=stds, capsize=4,
+              color=bar_color, label=label)
+        for i, ctx_size in enumerate(args.target_ctx_sizes):
+            vals = [r[f"{mode}_value"] for r in results if r["ctx_size"] == ctx_size]
+            ax.scatter([x_pos[i] + offset * width] * len(vals), vals,
+                      color=dot_color, zorder=3, s=16)
     ax.set_xticks(x_pos)
     ax.set_xticklabels(args.target_ctx_sizes)
     ax.set_xlabel("ctx_size")
     ax.set_ylabel(metric_name)
-    ax.set_title(f"{args.task}: {metric_name}, baseline vs. k-means-from-"
-                f"{args.oversample_factor}x, mean ± 1 std across {args.n_seeds} seeds\n"
-                f"(items_per_task={args.items_per_task}, dots = individual seed runs)")
-    ax.legend(frameon=False)
+    ax.set_title(f"{args.task}: {metric_name}, baseline vs. diverse vs. packed "
+                f"(from {args.oversample_factor}x oversampled pool)\n"
+                f"mean ± 1 std across {args.n_seeds} seeds, items_per_task={args.items_per_task} "
+                f"(dots = individual seed runs)")
+    ax.legend(frameon=False, fontsize=8)
     plt.tight_layout()
     fig.savefig(out_dir / "kmeans_check.png", dpi=150)
     log(f"wrote {out_dir / 'kmeans_check.png'} -- all done")
